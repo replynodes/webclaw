@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock as Lazy;
 
 use regex::Regex;
-use scraper::{Html, Selector};
+use scraper::{ElementRef, Html, Selector};
 use serde::Serialize;
 use url::Url;
 
@@ -93,6 +93,25 @@ static FONT_SHORTHAND_FAMILY: Lazy<Regex> = Lazy::new(|| {
     .unwrap()
 });
 
+/// Largest `NxN` token in a sizes attribute or URL (`32x32`, `180×180`).
+/// `sizes="any"` does not match.
+static ICON_DIMENSION: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)([0-9]{1,5})\s*[x×]\s*([0-9]{1,5})").unwrap());
+
+/// `touch-76`, `icon-256`, `favicon-32`, `apple-touch-icon-180`.
+static ICON_FILENAME_SIZE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:apple-touch-icon|favicon|touch|icon)[-_]?([0-9]{2,4})").unwrap()
+});
+
+const LOGO_EXCLUDE_TERMS: &[&str] = &[
+    "customer",
+    "partner",
+    "client",
+    "press-logo",
+    "logo-bar",
+    "customers",
+];
+
 macro_rules! selector {
     ($s:expr) => {{
         static SEL: Lazy<Selector> = Lazy::new(|| Selector::parse($s).unwrap());
@@ -116,10 +135,37 @@ pub fn extract_brand(html: &str, url: Option<&str>) -> BrandIdentity {
     let css_sources = collect_css(&doc);
     let colors = extract_colors(&css_sources, name.as_deref());
     let fonts = extract_fonts(&css_sources, name.as_deref());
-    let logo_url = find_logo(&doc, base_url.as_ref());
-    let favicon_url = find_favicon(&doc, base_url.as_ref());
-    let logos = find_all_logos(&doc, base_url.as_ref());
+    let mut logos = find_all_logos(&doc, base_url.as_ref());
+    let best_icon = find_best_icon(&doc, base_url.as_ref());
+    let mut favicon_url = find_favicon(&doc, base_url.as_ref());
     let og_image = find_og_image(&doc, base_url.as_ref());
+
+    // Explicit wordmark (including SVG) wins. Otherwise a raster Organization
+    // logo, then the best raster icon link, then a public favicon for the host.
+    let mut logo_url = find_logo(&doc, base_url.as_ref());
+    if logo_url.is_none() {
+        logo_url = find_jsonld_logo(&doc, base_url.as_ref());
+    }
+    if logo_url.is_none()
+        && let Some((icon_url, score)) = best_icon.as_ref()
+        && *score > 1
+    {
+        logo_url = Some(icon_url.clone());
+    }
+    if logo_url.is_none()
+        && let Some(fallback) = base_url.as_ref().and_then(public_favicon_url)
+    {
+        logo_url = Some(fallback.clone());
+        if favicon_url.is_none() {
+            favicon_url = Some(fallback.clone());
+        }
+        if logos.iter().all(|logo| logo.url != fallback) {
+            logos.push(LogoVariant {
+                url: fallback,
+                kind: "favicon".to_string(),
+            });
+        }
+    }
 
     BrandIdentity {
         name,
@@ -779,13 +825,18 @@ fn split_font_families(value: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 fn find_logo(doc: &Html, base_url: Option<&Url>) -> Option<String> {
-    if let Some(url) = find_logo_in_scope(doc, base_url, "header img, nav img") {
-        return Some(url);
+    for el in doc.select(selector!("header img, nav img")) {
+        if let Some(url) = header_logo_url(el, base_url) {
+            return Some(url);
+        }
     }
 
-    // Strategy 2: <a href="/"> containing an <img> (homepage link with image)
+    // Homepage link with an image. Skip customer/partner grids so a row of
+    // client logos that all point at "/" cannot become the brand mark.
     for el in doc.select(selector!("a[href='/'] img, a[href] img")) {
-        // Check if parent <a> links to homepage
+        if image_has_excluded_logo_term(el) {
+            continue;
+        }
         if let Some(parent) = el.parent().and_then(|p| p.value().as_element()) {
             let href = parent.attr("href").unwrap_or("");
             if (href == "/" || href.ends_with(".com") || href.ends_with(".com/"))
@@ -796,36 +847,311 @@ fn find_logo(doc: &Html, base_url: Option<&Url>) -> Option<String> {
         }
     }
 
+    find_single_unambiguous_logo(doc, base_url)
+}
+
+/// Header/nav logo. `class`, `id`, `alt`, `src`, `aria-label`, and the first
+/// srcset URL are all logo signals. A customer/partner/press grid is not.
+fn header_logo_url(el: ElementRef<'_>, base_url: Option<&Url>) -> Option<String> {
+    let class = el.value().attr("class").unwrap_or("");
+    let id = el.value().attr("id").unwrap_or("");
+    let alt = el.value().attr("alt").unwrap_or("");
+    let aria = el.value().attr("aria-label").unwrap_or("");
+    let src = el.value().attr("src").unwrap_or("").trim();
+    let srcset_attr = el.value().attr("srcset").unwrap_or("");
+    let srcset = first_srcset_candidate(srcset_attr);
+    let fields = [class, id, alt, aria, src, srcset];
+    if fields.iter().copied().any(contains_excluded_logo_term) {
+        return None;
+    }
+    let attr_signal = [class, id, alt, aria]
+        .iter()
+        .any(|field| contains_ci(field, "logo"));
+    let src_signal = contains_ci(src, "logo");
+    let srcset_signal = contains_ci(srcset, "logo");
+    if !attr_signal && !src_signal && !srcset_signal {
+        return None;
+    }
+
+    if !src.is_empty() && (attr_signal || src_signal) {
+        return Some(resolve_url(src, base_url));
+    }
+    if !srcset.is_empty() {
+        return Some(resolve_url(srcset, base_url));
+    }
     None
 }
 
-fn find_logo_in_scope(doc: &Html, base_url: Option<&Url>, selector_str: &str) -> Option<String> {
-    let selector = Selector::parse(selector_str).ok()?;
-    for el in doc.select(&selector) {
+/// One `<img>` anywhere whose class/id/alt/src names a logo, and does not
+/// name a customer grid. Two or more such images are ambiguous and ignored.
+fn find_single_unambiguous_logo(doc: &Html, base_url: Option<&Url>) -> Option<String> {
+    let mut found: Option<String> = None;
+    for el in doc.select(selector!("img")) {
+        if image_has_excluded_logo_term(el) {
+            continue;
+        }
         let class = el.value().attr("class").unwrap_or("");
         let id = el.value().attr("id").unwrap_or("");
         let alt = el.value().attr("alt").unwrap_or("");
-        let src = el.value().attr("src")?;
-        if contains_ci(class, "logo") || contains_ci(id, "logo") || contains_ci(alt, "logo") {
-            return Some(resolve_url(src, base_url));
+        let src = el.value().attr("src").unwrap_or("").trim();
+        let signal = [class, id, alt, src]
+            .iter()
+            .any(|field| contains_ci(field, "logo"));
+        if !signal || src.is_empty() {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(resolve_url(src, base_url));
+    }
+    found
+}
+
+fn image_has_excluded_logo_term(el: ElementRef<'_>) -> bool {
+    let srcset_attr = el.value().attr("srcset").unwrap_or("");
+    let srcset = first_srcset_candidate(srcset_attr);
+    [
+        el.value().attr("class").unwrap_or(""),
+        el.value().attr("id").unwrap_or(""),
+        el.value().attr("alt").unwrap_or(""),
+        el.value().attr("aria-label").unwrap_or(""),
+        el.value().attr("src").unwrap_or(""),
+        srcset,
+    ]
+    .iter()
+    .copied()
+    .any(contains_excluded_logo_term)
+}
+
+fn contains_excluded_logo_term(field: &str) -> bool {
+    LOGO_EXCLUDE_TERMS
+        .iter()
+        .any(|term| contains_ci(field, term))
+}
+
+fn first_srcset_candidate(srcset: &str) -> &str {
+    let first = srcset.split(',').next().unwrap_or("").trim();
+    first.split_whitespace().next().unwrap_or("")
+}
+
+// ---------------------------------------------------------------------------
+// Favicon / icon-link detection
+// ---------------------------------------------------------------------------
+
+/// Best `<link rel>` whose rel contains "icon". Raster icons outrank an SVG
+/// that happens to be listed first. The returned score is 1 for SVG and
+/// mask-icon (callers that need a servable bitmap skip those).
+fn find_best_icon(doc: &Html, base_url: Option<&Url>) -> Option<(String, u32)> {
+    let mut best: Option<(String, u32)> = None;
+    for el in doc.select(selector!("link[rel]")) {
+        let rel = el.value().attr("rel").unwrap_or("");
+        if !contains_ci(rel, "icon") {
+            continue;
+        }
+        let Some(href) = el.value().attr("href") else {
+            continue;
+        };
+        let href = href.trim();
+        if href.is_empty() {
+            continue;
+        }
+        let sizes = el.value().attr("sizes").unwrap_or("");
+        let score = icon_link_score(rel, href, sizes);
+        let replace = best
+            .as_ref()
+            .is_none_or(|(_, best_score)| score > *best_score);
+        if replace {
+            best = Some((resolve_url(href, base_url), score));
+        }
+    }
+    best
+}
+
+fn find_favicon(doc: &Html, base_url: Option<&Url>) -> Option<String> {
+    find_best_icon(doc, base_url).map(|(url, _score)| url)
+}
+
+/// Higher wins. SVG and `mask-icon` stay at 1 so a raster icon is preferred
+/// and so they are not promoted to `logo_url`.
+fn icon_link_score(rel: &str, href: &str, sizes: &str) -> u32 {
+    let ext = image_extension(href).unwrap_or_default();
+    if contains_ci(rel, "mask-icon") || ext == "svg" {
+        return 1;
+    }
+    let (rank, default_size) = match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "avif" => (3_u32, 48_u32),
+        "ico" => (2, 32),
+        _ => (2, 48),
+    };
+    let mut size = icon_pixel_size(sizes, href);
+    if size == 0 {
+        size = if contains_ci(rel, "apple") {
+            180
+        } else {
+            default_size
+        };
+    }
+    let apple = if contains_ci(rel, "apple") { 80 } else { 0 };
+    rank * 1000 + apple + size.min(1024)
+}
+
+fn icon_pixel_size(sizes: &str, url: &str) -> u32 {
+    let mut best = 0_u32;
+    for text in [sizes, url] {
+        for cap in ICON_DIMENSION.captures_iter(text) {
+            let width: u32 = cap[1].parse().unwrap_or(0);
+            let height: u32 = cap[2].parse().unwrap_or(0);
+            best = best.max(width.max(height));
+        }
+    }
+    if best > 0 {
+        return best;
+    }
+    let from_query = query_pixel_size(url);
+    if from_query > 0 {
+        return from_query;
+    }
+    filename_token_size(url)
+}
+
+fn query_pixel_size(url: &str) -> u32 {
+    let Some((_, query)) = url.split_once('?') else {
+        return 0;
+    };
+    let query = query.split('#').next().unwrap_or(query);
+    let mut best = 0_u32;
+    for pair in query.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        let key = parts.next().unwrap_or("");
+        let value = parts.next().unwrap_or("");
+        if matches!(
+            key.to_ascii_lowercase().as_str(),
+            "w" | "h" | "width" | "height"
+        ) && let Ok(pixels) = value.parse::<u32>()
+        {
+            best = best.max(pixels);
+        }
+    }
+    best
+}
+
+fn filename_token_size(url: &str) -> u32 {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let mut best = 0_u32;
+    for cap in ICON_FILENAME_SIZE.captures_iter(file) {
+        if let Ok(pixels) = cap[1].parse::<u32>() {
+            best = best.max(pixels);
+        }
+    }
+    best
+}
+
+fn image_extension(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let (_, ext) = file.rsplit_once('.')?;
+    if ext.is_empty() || ext.len() > 8 || !ext.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(ext.to_ascii_lowercase())
+}
+
+fn is_raster_image_url(url: &str) -> bool {
+    matches!(
+        image_extension(url).as_deref(),
+        Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "avif" | "ico")
+    )
+}
+
+/// Raster `Organization.logo` from JSON-LD, including `@graph`. SVG wordmarks
+/// are ignored so an icon or public favicon can still be served.
+fn find_jsonld_logo(doc: &Html, base_url: Option<&Url>) -> Option<String> {
+    for el in doc.select(selector!("script")) {
+        let kind = el.value().attr("type").unwrap_or("");
+        if !contains_ci(kind, "ld+json") {
+            continue;
+        }
+        let text: String = el.text().collect();
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+            continue;
+        };
+        if let Some(raw) = organization_raster_logo(&value) {
+            return Some(resolve_url(&raw, base_url));
         }
     }
     None
 }
 
-// ---------------------------------------------------------------------------
-// Favicon detection
-// ---------------------------------------------------------------------------
+fn organization_raster_logo(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Array(items) => items.iter().find_map(organization_raster_logo),
+        serde_json::Value::Object(map) => {
+            if map.get("@type").is_some_and(is_organization_type)
+                && let Some(logo) = map.get("logo").and_then(raster_logo_value)
+            {
+                return Some(logo);
+            }
+            for (key, child) in map {
+                if key == "@context" || key == "@type" || key == "logo" {
+                    continue;
+                }
+                if let Some(logo) = organization_raster_logo(child) {
+                    return Some(logo);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
 
-fn find_favicon(doc: &Html, base_url: Option<&Url>) -> Option<String> {
-    doc.select(selector!("link[rel]"))
-        .find(|el| {
-            el.value()
-                .attr("rel")
-                .is_some_and(|r| r.to_lowercase().contains("icon"))
-        })
-        .and_then(|el| el.value().attr("href"))
-        .map(|href| resolve_url(href, base_url))
+fn is_organization_type(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(raw) => schema_type_is_organization(raw),
+        serde_json::Value::Array(items) => items.iter().any(is_organization_type),
+        _ => false,
+    }
+}
+
+fn schema_type_is_organization(raw: &str) -> bool {
+    let name = raw.trim().rsplit(['/', ':']).next().unwrap_or(raw).trim();
+    name.eq_ignore_ascii_case("organization")
+}
+
+fn raster_logo_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(url) => raster_logo_string(url),
+        serde_json::Value::Object(map) => map
+            .get("url")
+            .and_then(|url| url.as_str())
+            .and_then(raster_logo_string),
+        serde_json::Value::Array(items) => items.iter().find_map(raster_logo_value),
+        _ => None,
+    }
+}
+
+fn raster_logo_string(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty() || !is_raster_image_url(url) {
+        return None;
+    }
+    Some(url.to_string())
+}
+
+/// `https://www.google.com/s2/favicons?domain={host}&sz=128`
+fn public_favicon_url(page: &Url) -> Option<String> {
+    let host = page.host_str()?;
+    if host.is_empty() {
+        return None;
+    }
+    let mut favicon = Url::parse("https://www.google.com/s2/favicons").ok()?;
+    favicon
+        .query_pairs_mut()
+        .append_pair("domain", host)
+        .append_pair("sz", "128");
+    Some(favicon.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1250,8 +1576,31 @@ mod tests {
         </body></html>"#;
 
         let brand = extract_brand(html, Some("https://example.com"));
-        assert_eq!(brand.logo_url, None);
-        assert!(brand.logos.is_empty());
+        let logo = brand
+            .logo_url
+            .expect("host should fall back to a public favicon");
+        assert!(
+            logo.contains("domain=example.com"),
+            "customer grid must not be selected, got {logo}"
+        );
+        assert!(logo.contains("sz=128"), "{logo}");
+        assert!(
+            !logo.contains("runway") && !logo.contains("zapier"),
+            "{logo}"
+        );
+        assert_eq!(brand.favicon_url.as_deref(), Some(logo.as_str()));
+        assert!(
+            brand
+                .logos
+                .iter()
+                .all(|entry| { !entry.url.contains("runway") && !entry.url.contains("zapier") })
+        );
+        assert!(
+            brand
+                .logos
+                .iter()
+                .any(|entry| entry.kind == "favicon" && entry.url == logo)
+        );
     }
 
     #[test]
@@ -1524,5 +1873,387 @@ mod tests {
 
         let brand = extract_brand(&html, None);
         assert!(brand.colors.len() <= 10, "should cap at 10 colors");
+    }
+
+    #[test]
+    fn test_favicon_prefers_png_over_svg() {
+        let html = r#"<html><head>
+            <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+            <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+        </head><body></body></html>"#;
+
+        let brand = extract_brand(html, Some("https://example.com"));
+        assert_eq!(
+            brand.favicon_url.as_deref(),
+            Some("https://example.com/favicon-32.png")
+        );
+    }
+
+    #[test]
+    fn test_icon_only_page_promotes_apple_touch_png() {
+        // Stripe-shaped: inline header SVG is not a URL, and the 180px
+        // apple-touch PNG outranks a 96px PNG and an SVG icon.
+        let html = r#"<html><head>
+            <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+            <link rel="icon" type="image/png" sizes="96x96" href="/favicon-96x96.png">
+            <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+        </head><body>
+            <header>
+                <a href="/" aria-label="Stripe">
+                    <svg viewBox="0 0 24 24"><path d="M0 0h24v24H0z"/></svg>
+                </a>
+            </header>
+        </body></html>"#;
+
+        let brand = extract_brand(html, Some("https://stripe.com"));
+        assert_eq!(
+            brand.logo_url.as_deref(),
+            Some("https://stripe.com/apple-touch-icon.png")
+        );
+    }
+
+    #[test]
+    fn test_jsonld_raster_logo_beats_favicon() {
+        let string_logo = r#"<html><head>
+            <link rel="icon" href="/favicon.ico">
+            <script type="application/ld+json">
+            {
+              "@context": "https://schema.org",
+              "@type": "Organization",
+              "name": "Example",
+              "logo": "https://cdn.example.com/logo.png"
+            }
+            </script>
+        </head><body></body></html>"#;
+        let brand = extract_brand(string_logo, Some("https://example.com"));
+        assert_eq!(
+            brand.logo_url.as_deref(),
+            Some("https://cdn.example.com/logo.png")
+        );
+        assert_eq!(
+            brand.favicon_url.as_deref(),
+            Some("https://example.com/favicon.ico")
+        );
+
+        let graph_logo = r#"<html><head>
+            <link rel="icon" href="/favicon.ico">
+            <script type="application/ld+json">
+            {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "Organization",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "url": "https://cdn.example.com/brand.jpg"
+                  }
+                }
+              ]
+            }
+            </script>
+        </head><body></body></html>"#;
+        let brand = extract_brand(graph_logo, Some("https://example.com"));
+        assert_eq!(
+            brand.logo_url.as_deref(),
+            Some("https://cdn.example.com/brand.jpg")
+        );
+
+        let svg_logo = r#"<html><head>
+            <link rel="icon" href="/favicon.ico">
+            <script type="application/ld+json">
+            {"@type":"Organization","logo":"https://cdn.example.com/logo.svg"}
+            </script>
+        </head><body></body></html>"#;
+        let brand = extract_brand(svg_logo, Some("https://example.com"));
+        assert_eq!(
+            brand.logo_url.as_deref(),
+            Some("https://example.com/favicon.ico"),
+            "non-raster JSON-LD logos are not servable wordmarks"
+        );
+    }
+
+    #[test]
+    fn test_header_svg_logo_beats_apple_touch_icon() {
+        let html = r#"<html><head>
+            <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+            <link rel="icon" href="/favicon.ico">
+        </head><body>
+            <header><img class="logo" src="/logo.svg" alt="Acme"></header>
+        </body></html>"#;
+
+        let brand = extract_brand(html, Some("https://example.com"));
+        assert_eq!(
+            brand.logo_url.as_deref(),
+            Some("https://example.com/logo.svg")
+        );
+    }
+
+    #[test]
+    fn test_challenge_html_uses_public_favicon() {
+        let html = r#"<html><head><title>Just a moment...</title></head>
+            <body><p>Checking your browser</p></body></html>"#;
+        let brand = extract_brand(html, Some("https://openai.com/"));
+        let logo = brand.logo_url.expect("empty document with a host");
+        assert!(logo.contains("domain=openai.com"), "{logo}");
+        assert!(logo.contains("sz=128"), "{logo}");
+        assert!(logo.starts_with("https://www.google.com/s2/favicons?"));
+        assert_eq!(brand.favicon_url.as_deref(), Some(logo.as_str()));
+        assert!(
+            brand
+                .logos
+                .iter()
+                .any(|entry| entry.kind == "favicon" && entry.url == logo)
+        );
+    }
+
+    #[test]
+    fn test_srcset_header_logo() {
+        let html = r#"<html><body>
+            <header>
+                <img srcset="/images/logo-wordmark.png 1x, /images/logo-wordmark@2x.png 2x" alt="Acme">
+            </header>
+        </body></html>"#;
+        let brand = extract_brand(html, Some("https://example.com"));
+        assert_eq!(
+            brand.logo_url.as_deref(),
+            Some("https://example.com/images/logo-wordmark.png")
+        );
+
+        let src_signal = r#"<html><body>
+            <header><img src="/assets/logo.png" alt="Acme"></header>
+        </body></html>"#;
+        let brand = extract_brand(src_signal, Some("https://example.com"));
+        assert_eq!(
+            brand.logo_url.as_deref(),
+            Some("https://example.com/assets/logo.png")
+        );
+
+        let aria = r#"<html><body>
+            <header>
+                <img aria-label="Acme logo" srcset="https://cdn.example.com/mark.png 200w">
+            </header>
+        </body></html>"#;
+        let brand = extract_brand(aria, Some("https://example.com"));
+        assert_eq!(
+            brand.logo_url.as_deref(),
+            Some("https://cdn.example.com/mark.png")
+        );
+    }
+
+    #[test]
+    fn test_single_body_logo_is_used_until_a_second_appears() {
+        let one = r#"<html><body>
+            <img class="brand-logo" src="/only-logo.png" alt="Acme">
+        </body></html>"#;
+        let brand = extract_brand(one, Some("https://example.com"));
+        assert_eq!(
+            brand.logo_url.as_deref(),
+            Some("https://example.com/only-logo.png")
+        );
+
+        let two = r#"<html><body>
+            <img class="brand-logo" src="/a-logo.png" alt="A logo">
+            <img id="site-logo" src="/b-logo.png" alt="B logo">
+        </body></html>"#;
+        let brand = extract_brand(two, Some("https://example.com"));
+        let logo = brand.logo_url.expect("ambiguous body logos fall back");
+        assert!(logo.contains("domain=example.com"), "{logo}");
+        assert!(
+            !logo.contains("a-logo") && !logo.contains("b-logo"),
+            "{logo}"
+        );
+    }
+
+    #[test]
+    fn test_icon_link_score_prefers_raster_and_reads_size() {
+        assert_eq!(icon_link_score("icon", "/favicon.svg", ""), 1);
+        assert_eq!(icon_link_score("mask-icon", "/pinned.png", "16x16"), 1);
+        assert_eq!(
+            icon_link_score("apple-touch-icon", "/logo.svg", "180x180"),
+            1
+        );
+        assert_eq!(icon_link_score("icon", "/favicon.ico", ""), 2_000 + 32);
+        assert_eq!(
+            icon_link_score("icon", "/favicon-32.png", "32x32"),
+            3_000 + 32
+        );
+        assert_eq!(
+            icon_link_score("icon", "/favicon-32x32.png?w=256", ""),
+            3_000 + 32,
+            "NxN in the URL beats a larger query size"
+        );
+        assert_eq!(
+            icon_link_score("icon", "/logo.png?w=128&h=64", ""),
+            3_000 + 128
+        );
+        assert_eq!(icon_link_score("icon", "/touch-76.png", ""), 3_000 + 76);
+        assert_eq!(icon_link_score("icon", "/icon-256.png", ""), 3_000 + 256);
+        assert_eq!(icon_link_score("icon", "/favicon-32.png", ""), 3_000 + 32);
+        assert_eq!(
+            icon_link_score("apple-touch-icon", "/apple-touch-icon.png", "any"),
+            3_000 + 80 + 180
+        );
+        assert_eq!(
+            icon_link_score("apple-touch-icon", "/apple-touch-icon.png", "180x180"),
+            3_000 + 80 + 180
+        );
+        assert_eq!(
+            icon_link_score("icon", "/favicon-96x96.png", ""),
+            3_000 + 96
+        );
+        assert!(
+            icon_link_score("apple-touch-icon", "/apple-touch-icon.png", "180x180")
+                > icon_link_score("icon", "/favicon-96x96.png", "96x96")
+        );
+    }
+
+    #[test]
+    fn test_popular_domains_get_servable_logo_url() {
+        let icon_only = r#"<html><head>
+            <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+            <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+            <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+        </head><body>
+            <header><a href="/"><svg viewBox="0 0 32 32" aria-label="Logo"></svg></a></header>
+        </body></html>"#;
+        let empty = r#"<html><head><title>Just a moment...</title></head>
+            <body><p>Enable JavaScript and cookies to continue</p></body></html>"#;
+        let wordmark = |attrs: &str, src: &str| {
+            format!(
+                r#"<html><head>
+                    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+                    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+                </head><body>
+                    <header><img {attrs} src="{src}" alt="Brand"></header>
+                </body></html>"#
+            )
+        };
+
+        let icon_domains = [
+            "stripe.com",
+            "notion.so",
+            "linear.app",
+            "github.com",
+            "vercel.com",
+            "figma.com",
+            "spotify.com",
+            "netflix.com",
+            "airbnb.com",
+            "cloudflare.com",
+            "anthropic.com",
+        ];
+        let empty_domains = [
+            "openai.com",
+            "apple.com",
+            "amazon.com",
+            "nvidia.com",
+            "atlassian.com",
+        ];
+        let wordmarks = [
+            (
+                "slack.com",
+                wordmark("class=\"logo\"", "/img/slack-logo.png"),
+                "/img/slack-logo.png",
+            ),
+            (
+                "google.com",
+                wordmark(
+                    "id=\"hplogo\"",
+                    "/images/branding/googlelogo/2x/googlelogo_color_272x92dp.png",
+                ),
+                "/images/branding/googlelogo/2x/googlelogo_color_272x92dp.png",
+            ),
+            (
+                "discord.com",
+                wordmark("class=\"logo\"", "/assets/discord-logo.svg"),
+                "/assets/discord-logo.svg",
+            ),
+            (
+                "shopify.com",
+                wordmark("class=\"logo\"", "/brand/shopify-logo.svg"),
+                "/brand/shopify-logo.svg",
+            ),
+            (
+                "dropbox.com",
+                wordmark("class=\"logo\"", "/brand/dropbox-logo.svg"),
+                "/brand/dropbox-logo.svg",
+            ),
+            (
+                "microsoft.com",
+                wordmark("class=\"logo\"", "/images/microsoft-logo.jpg"),
+                "/images/microsoft-logo.jpg",
+            ),
+        ];
+
+        let mut cases: Vec<(&str, String, String)> = Vec::new();
+        for domain in icon_domains {
+            cases.push((
+                domain,
+                icon_only.to_string(),
+                format!("https://{domain}/apple-touch-icon.png"),
+            ));
+        }
+        for (domain, html, path) in wordmarks {
+            cases.push((domain, html, format!("https://{domain}{path}")));
+        }
+        for domain in empty_domains {
+            cases.push((
+                domain,
+                empty.to_string(),
+                format!("https://www.google.com/s2/favicons?domain={domain}&sz=128"),
+            ));
+        }
+        assert_eq!(cases.len(), 22);
+
+        let mut new_hits = 0;
+        let mut old_hits = 0;
+        for (domain, html, expected) in &cases {
+            let page = format!("https://{domain}/");
+            let brand = extract_brand(html, Some(&page));
+            let logo = brand.logo_url.unwrap_or_default();
+            assert!(!logo.is_empty(), "{domain} produced an empty logo_url");
+            assert_eq!(logo, *expected, "{domain}");
+            new_hits += 1;
+            if header_only_logo(html, &page).is_some() {
+                old_hits += 1;
+            }
+        }
+        assert_eq!(new_hits, cases.len(), "every fixture should hit");
+        assert!(
+            new_hits > old_hits,
+            "servable fallback should beat the header-only finder ({new_hits} vs {old_hits})"
+        );
+    }
+
+    /// Previous `find_logo`: header/nav class, id, or alt containing "logo",
+    /// else an image inside a homepage link. No icon or host fallback.
+    fn header_only_logo(html: &str, page_url: &str) -> Option<String> {
+        let doc = Html::parse_document(html);
+        let base = Url::parse(page_url).ok();
+        let header = Selector::parse("header img, nav img").unwrap();
+        for el in doc.select(&header) {
+            let class = el.value().attr("class").unwrap_or("");
+            let id = el.value().attr("id").unwrap_or("");
+            let alt = el.value().attr("alt").unwrap_or("");
+            if let Some(src) = el.value().attr("src")
+                && (contains_ci(class, "logo")
+                    || contains_ci(id, "logo")
+                    || contains_ci(alt, "logo"))
+            {
+                return Some(resolve_url(src, base.as_ref()));
+            }
+        }
+        let home = Selector::parse("a[href='/'] img, a[href] img").unwrap();
+        for el in doc.select(&home) {
+            if let Some(parent) = el.parent().and_then(|p| p.value().as_element()) {
+                let href = parent.attr("href").unwrap_or("");
+                if (href == "/" || href.ends_with(".com") || href.ends_with(".com/"))
+                    && let Some(src) = el.value().attr("src")
+                {
+                    return Some(resolve_url(src, base.as_ref()));
+                }
+            }
+        }
+        None
     }
 }
